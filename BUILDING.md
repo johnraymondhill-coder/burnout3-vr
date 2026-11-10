@@ -1,0 +1,13 @@
+# Developer build notes
+
+The `work/burnout3-vr` and `work/xboxrecomp` directories contain the modified title and runtime sources used by these builds. `UPSTREAM.json` records the base commits; these snapshots include local changes beyond those commits. No generated game code or disc-derived input is supplied. Rebuilding requires your own supported disc.
+
+Keep the sibling directory layout under `work/`. Refer also to the title's `docs/`, `regen.sh`, CMake files and runtime build documentation. These are development build scripts, not a fully automated clean-machine toolchain bootstrap.
+
+1. Extract your supported disc into `work/burnout3-vr/Burnout 3 Takedown/`. Install Python 3.12, the runtime's Python requirements, CMake and Ninja. The supplied Windows helpers expect the CMake/Ninja tools at `work/burnout-toolchain/python/Scripts/`; adapt those paths for your environment.
+2. Run `python work/burnout3-vr/tools/quest_regen_windows.py` to regenerate the NTSC-U title code from your executable. Do not publish generated disc-derived sources or your disc inputs.
+3. For PCVR, prepare upstream SDL2 2.32.10, glslang and OpenXR SDK sources under `work/burnout-deps/{SDL2-src,glslang-src,OpenXR-SDK}`. `work/setup_pcvr.py` prepares LLVM-MinGW 20260922, Windows SDL2, glslang and OpenXR dependencies; also supply Vulkan headers and the MinGW import library under `work/pcvr-deps/vulkan/{include,lib}` as referenced by `build_pcvr.py`. Run `python work/build_pcvr.py`. Output: `work/burnout3-vr/build/pcvr/burnout3.exe`.
+4. For Quest, install Android NDK r28c at `work/burnout-toolchain/android-ndk-r28c`; Android API 35, build-tools/android-15 and JDK 21 at the paths in `tools/quest_build_apk.py`. Prepare SDL2, glslang and OpenXR loader AAR under `work/burnout-deps/`; build/install SDL2 with `tools/quest_build_deps.py` and glslang with the same arm64 Android toolchain. Run `tools/quest_build_native.py --vr`, then `tools/quest_build_apk.py`. Use your own Android signing keystore, adapting the signing arguments in that script. Do not publish your signing key.
+5. To rebuild the setup GUI, install PyInstaller and run it against `work/community_launcher.py` with `--onefile --windowed --paths work/burnout3-vr/tools/install`. Package the manifest and installer modules beside it as shown in the release ZIP. The launcher uses relative paths; no publisher-specific game path is required.
+
+Rebuilding the complete executable allows replacement of the statically linked runtime components using the supplied modified runtime sources. All upstream license notices must accompany redistributed builds. External dependency versions and tool paths may need adjustment; a clean-machine reproduction of this build process has not yet been verified.

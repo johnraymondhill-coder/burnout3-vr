@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# build-windows.sh: Takedawn for Windows x64, as one setup exe.
+#
+#   tools/release/build-windows.sh [--no-setup] [--no-setup-window]
+#
+#   dist/<version>/Takedawn-<version>-windows-x64-setup.exe
+#   build/release/windows/Takedawn/           the program folder it installs
+#
+# The program is cross-built here (macOS or Linux) with llvm-mingw, the way
+# every Windows build of this port has been made (tools/win/fetch-deps.sh
+# holds the pins: llvm-mingw, SDL2, the Vulkan headers, glslang); only the
+# setup compiler needs Windows. The program folder:
+#
+#   Takedawn.exe          the game; a window program with the icon and a
+#                         version resource: the North America disc's program,
+#                         which starts the program of the disc that is
+#                         installed (src/game/package.h).
+#                         Takedawn.exe --install <image|folder>
+#   Takedawn-pal.exe      the Europe Fr/De/It disc's program
+#   Takedawn-ensv.exe     the Europe/Australia En/Es/Nl/Sv disc's
+#   SDL2.dll              the pinned SDL2 (Zlib licence)
+#   licenses\             the notices, licence texts and SOURCE.txt
+#   shaders\upscale\      the texture upscaler's LGPL shader files (BO-245)
+#   README.txt
+#   takedawn-setup.exe    the setup window (Qt), which the game starts when
+#   Qt6*.dll, libc++.dll, its data is not installed; cross-built here against
+#   platforms\, styles\   the pinned qt.io kit (--no-setup-window leaves it out)
+#
+# glslang, libc++ and winpthreads are linked statically, the UCRT is part of
+# Windows 10 and later, vulkan-1.dll is the graphics driver's; the audit below
+# fails the build when the exe imports anything else.
+#
+# The setup exe (tools/release/windows/takedawn.iss: per user, no
+# administrator rights, no zip) is compiled with Inno Setup on the Windows
+# machine named by TAKEDAWN_WIN_HOST (ssh, PowerShell) in the one folder
+# TAKEDAWN_WIN_DIR; tools/release/windows/remote.ps1 says what runs there
+# (--version, --install --check with TAKEDAWN_WIN_DISC, the compile, and an
+# install of a registry-free test variant into that folder to check the
+# payload). Without a host, or with --no-setup, the program folder and the
+# .iss are the result and the script says so.
+#
+# On Windows itself (Git Bash) the script runs as it is, with
+# TAKEDAWN_PYTHON set (python3 there is often the Store's stand-in), and
+# TAKEDAWN_WIN_HOST=local does the Windows step on this machine with
+# PowerShell and cp instead of ssh and scp. The setup window is then built
+# with the Windows Qt kit's own moc and rcc.
+#
+# Nothing is code-signed (decided).
+source "$(dirname "$0")/common.sh"
+source "$REPO/tools/release/pins.env"
+SETUP=1; WITH_SETUP="${TAKEDAWN_SETUP:-1}"
+for a in "$@"; do case "$a" in --no-setup) SETUP=0 ;; --no-setup-window) WITH_SETUP=0 ;; *) die "unknown option $a" ;; esac; done
+
+assert_gen_all
+B="$WORK/windows"
+D="${BO3_WINDEPS:-$HOME/.cache/bo3-windeps}"
+t0=$(date +%s)
+[ -x "$D/llvm-mingw/bin/x86_64-w64-mingw32-clang" ] && [ -f "$D/glslang/lib/libglslang.a" ] \
+    || BO3_WINDEPS="$D" "$REPO/tools/win/fetch-deps.sh"
+
+mkdir -p "$B/icon"
+pngs=()
+for s in 16 24 32 48 64 128 256; do
+    render_icon "$REPO/assets/icon/takedawn.svg" "$s" "$B/icon/$s.png"; pngs+=("$B/icon/$s.png")
+done
+"${TAKEDAWN_PYTHON:-python3}" "$REPO/tools/release/make_ico.py" "$B/takedawn.ico" "${pngs[@]}"
+
+# Each program of the package (common.sh, PKG_REGIONS): build/, bin/ for the
+# main one, build<suffix>/, bin<suffix>/ for the PAL package's second.
+for r in $PKG_REGIONS; do
+    use_region "$r"
+    say "$r: configuring (x86_64-w64-mingw32, SDL2 + Vulkan)"
+    cmake -S "$REPO" -B "$B/build$PROG_SUFFIX" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBO3_RELEASE=ON -DBO3_REGION="$PROG_REGION" \
+        -DCMAKE_TOOLCHAIN_FILE="$REPO/cmake/llvm-mingw-x86_64.cmake" -DLLVM_MINGW_ROOT="$D/llvm-mingw" \
+        -DXBOXRECOMP_DIR="$TOOLKIT" -DBO3_BIN_DIR="$B/bin$PROG_SUFFIX" -DBO3_WIN_ICON="$B/takedawn.ico" \
+        -DCMAKE_PREFIX_PATH="$(native_path "$D/SDL2/x86_64-w64-mingw32");$(native_path "$D/glslang")" \
+        -DVulkan_INCLUDE_DIR="$D/vulkan/include" -DVulkan_LIBRARY="$D/vulkan/lib/libvulkan-1.dll.a" \
+        > "$B/configure$PROG_SUFFIX.log" 2>&1 || { tail -20 "$B/configure$PROG_SUFFIX.log" >&2; die "configure failed ($B/configure$PROG_SUFFIX.log)"; }
+    say "$r: building (-j$JOBS, nice $NICE)"
+    tb=$(date +%s)
+    nice -n "$NICE" cmake --build "$B/build$PROG_SUFFIX" --target burnout3 -j"$JOBS" > "$B/build$PROG_SUFFIX.log" 2>&1 \
+        || { tail -30 "$B/build$PROG_SUFFIX.log" >&2; die "build failed ($B/build$PROG_SUFFIX.log)"; }
+    say "$r: build took $(( $(date +%s) - tb )) s"
+    # -ffp-contract=off held: no fused multiply-add anywhere (BO-282.2).
+    "$REPO/tools/release/check-fp.sh" "$D/llvm-mingw/bin/llvm-objdump" "$B/bin$PROG_SUFFIX/Takedawn.exe" \
+        || die "$r: fused multiply-add in the program (tools/release/check-fp.sh)"
+done
+use_region "${PKG_REGIONS%% *}"; assert_gen
+
+# ── the program folder ───────────────────────────────────────────────
+PKG="$B/Takedawn"
+rm -rf "$PKG"; mkdir -p "$PKG"
+cp "$B/bin/Takedawn.exe" "$PKG/"
+# The other discs' programs, which Takedawn.exe starts when that disc or its
+# data is the player's.
+for r in $PKG_REGIONS; do
+    use_region "$r"
+    [ -z "$PROG_SUFFIX" ] || cp "$B/bin$PROG_SUFFIX/Takedawn.exe" "$PKG/Takedawn$PROG_SUFFIX.exe"
+done
+use_region "${PKG_REGIONS%% *}"
+cp "$D/SDL2/x86_64-w64-mingw32/bin/SDL2.dll" "$PKG/"
+copy_licenses "$PKG/licenses"
+# The menu pictures' upscaler (BO-311): realesrgan-ncnn-vulkan.exe, its
+# vcomp140.dll and the two models, in upscaler\ beside Takedawn.exe.
+stage_upscaler windows "$PKG/upscaler" "$PKG/upscaler/models"
+# The texture upscaler's LGPL shader files (BO-245): the game reads them at
+# runtime from <exe dir>\shaders\upscale, and with none there texture upscale
+# stays off. The same file set as the Linux package; the .metal copies are the
+# macOS build's.
+U="$PKG/shaders/upscale"; mkdir -p "$U"
+cp "$TOOLKIT/third_party/upscale_shaders/"*.comp "$TOOLKIT/third_party/upscale_shaders/VERSION" \
+   "$TOOLKIT/third_party/upscale_shaders/NOTICE.md" "$TOOLKIT/third_party/upscale_shaders/"COPYING* "$U/"
+cp -R "$TOOLKIT/third_party/upscale_shaders/upstream" "$U/"
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@DISC@/$DISC_NAME/g" "$REPO/tools/release/windows/README.txt" | sed 's/$/\r/' > "$PKG/README.txt"
+HAVE_SETUP=no
+if [ "$WITH_SETUP" = 1 ]; then
+    # The setup window, cross-built against the pinned qt.io kit for llvm-mingw
+    # (the host kit of the same version supplies moc and rcc), with the Qt
+    # DLLs, the platform plugin and the style beside it: what windeployqt
+    # would copy, worked out from the import tables.
+    QTW="$(qt_kit windows desktop win64_llvm_mingw)"
+    qt_path="$PATH"
+    case "$(uname -s)" in
+        Darwin) QTH="$(qt_kit mac desktop clang_64)" ;;
+        MINGW*|MSYS*|CYGWIN*)
+            # The Windows kit's own moc and rcc run here; they need the kit's
+            # DLLs and llvm-mingw's libc++ on PATH.
+            QTH="$QTW"
+            qt_path="$(posix_path "$QTW/bin"):$(posix_path "$D/llvm-mingw/x86_64-w64-mingw32/bin"):$PATH" ;;
+        *) QTH="$(qt_kit linux desktop linux_gcc_64)" ;;
+    esac
+    say "building the setup window (Qt $QT_VERSION for Windows)"
+    icon_py=(); [ -n "${TAKEDAWN_PYTHON:-}" ] && icon_py=(-DTAKEDAWN_ICON_PYTHON="$TAKEDAWN_PYTHON")
+    PATH="$qt_path" LLVM_MINGW="$(native_path "$D/llvm-mingw")" cmake -S "$REPO/tools/install/gui" -B "$B/setup" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE="$REPO/tools/install/gui/packaging/windows-toolchain.cmake" \
+        -DCMAKE_PREFIX_PATH="$QTW" -DQT_HOST_PATH="$QTH" -DTAKEDAWN_ICO="$B/takedawn.ico" \
+        ${icon_py[@]+"${icon_py[@]}"} > "$B/setup-configure.log" 2>&1 \
+        || { tail -20 "$B/setup-configure.log" >&2; die "setup window: configure failed"; }
+    PATH="$qt_path" LLVM_MINGW="$(native_path "$D/llvm-mingw")" nice -n "$NICE" cmake --build "$B/setup" --target takedawn-setup -j"$JOBS" \
+        > "$B/setup-build.log" 2>&1 || { tail -30 "$B/setup-build.log" >&2; die "setup window: build failed ($B/setup-build.log)"; }
+    mkdir -p "$PKG/platforms" "$PKG/styles"
+    cp "$B/setup/takedawn-setup.exe" "$PKG/"
+    cp "$QTW/plugins/platforms/qwindows.dll" "$PKG/platforms/"
+    cp "$QTW/plugins/styles/qmodernwindowsstyle.dll" "$PKG/styles/" 2>/dev/null || true
+    "${TAKEDAWN_PYTHON:-python3}" - "$PKG" "$QTW/bin" "$D/llvm-mingw/x86_64-w64-mingw32/bin" "$D/llvm-mingw/bin/llvm-objdump" <<'PY' || die "setup window: could not gather its DLLs"
+import os, shutil, subprocess, sys
+pkg, qtbin, rtbin, objdump = sys.argv[1:5]
+def deps(path):
+    out = subprocess.run([objdump, "-p", path], capture_output=True, text=True).stdout
+    return [l.split(":", 1)[1].strip() for l in out.splitlines() if "DLL Name:" in l]
+seen, todo = set(), [os.path.join(pkg, "takedawn-setup.exe")]
+for sub in ("platforms", "styles"):
+    for dp, _, fn in os.walk(os.path.join(pkg, sub)):
+        todo += [os.path.join(dp, f) for f in fn]
+while todo:
+    cur = todo.pop()
+    for d in deps(cur):
+        key = d.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        for folder in (qtbin, rtbin):
+            src = os.path.join(folder, d)
+            if os.path.isfile(src):
+                if not os.path.isfile(os.path.join(pkg, d)):
+                    shutil.copy2(src, pkg)
+                todo.append(os.path.join(pkg, d))
+                break
+print("==> setup window DLLs: " + ", ".join(sorted(f for f in os.listdir(pkg) if f.endswith(".dll"))))
+PY
+    rm -rf "$PKG/licenses"; copy_licenses "$PKG/licenses" qt
+    HAVE_SETUP=yes
+else
+    say "the folder is built without the setup window (--no-setup-window)"
+fi
+
+# What each exe imports: SDL2.dll, the driver's Vulkan loader and Windows.
+for r in $PKG_REGIONS; do
+    use_region "$r"
+    pe="$("$D/llvm-mingw/bin/llvm-objdump" -p "$PKG/Takedawn$PROG_SUFFIX.exe")"
+    imports="$(printf '%s\n' "$pe" | sed -n 's/^ *DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u)"
+    bad="$(printf '%s\n' "$imports" | grep -v -E '^(sdl2|vulkan-1|kernel32|user32|gdi32|dbghelp|advapi32|shell32|ole32|oleaut32|winmm|ws2_32|iphlpapi|bcrypt|ntdll|dxgi|version|imm32|setupapi|shlwapi|psapi|winhttp|api-ms-win-crt-[a-z0-9-]+)\.dll$' || true)"
+    [ -z "$bad" ] || die "Takedawn$PROG_SUFFIX.exe imports DLLs the package does not carry: $bad"
+    case "$pe" in *"(Windows GUI)"*) ;; *) die "Takedawn$PROG_SUFFIX.exe is not a window program" ;; esac
+done
+use_region "${PKG_REGIONS%% *}"
+say "program folder: $(du -sh "$PKG" | cut -f1), Takedawn.exe $(( $(stat -c %s "$PKG/Takedawn.exe" 2>/dev/null || stat -f %z "$PKG/Takedawn.exe") / 1024 / 1024 )) MB (setup window: $HAVE_SETUP)"
+
+HOST="${TAKEDAWN_WIN_HOST:-}"
+if [ "$SETUP" = 0 ] || [ -z "$HOST" ]; then
+    say "NOT DONE: the setup exe. Compile tools/release/windows/takedawn.iss with Inno Setup $INNOSETUP_VERSION on Windows:"
+    say "  ISCC.exe /DPackage=<copy of $PKG> /DVersion=$VERSION /DIcon=<copy of $B/takedawn.ico> takedawn.iss"
+    say "  (set TAKEDAWN_WIN_HOST and TAKEDAWN_WIN_DIR to have this script do it over ssh,"
+    say "   or TAKEDAWN_WIN_HOST=local when this is Windows)"
+    exit 0
+fi
+
+# ── on the Windows machine ───────────────────────────────────────────
+WDIR="${TAKEDAWN_WIN_DIR:?TAKEDAWN_WIN_DIR: the folder on the Windows machine}"
+WFWD="$(printf '%s' "$WDIR" | tr '\\' '/')"
+if [ "$HOST" = local ]; then
+    [ "$WIN_HOST" = 1 ] || die "TAKEDAWN_WIN_HOST=local is for a build on Windows (Git Bash)"
+    on_win()   { powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$1"; }
+    to_win()   { cp -R "$@" "$(posix_path "$WFWD")/"; }
+    from_win() { cp "$(posix_path "$WFWD")/$1" "$2"; }
+else
+    on_win()   { ssh "$HOST" "$1"; }
+    to_win()   { scp -q -r "$@" "$HOST:$WFWD/"; }
+    from_win() { scp -q "$HOST:$WFWD/$1" "$2"; }
+fi
+say "copying the program folder to the Windows machine"
+on_win "New-Item -ItemType Directory -Force '$WDIR' | Out-Null; foreach (\$p in 'Takedawn','out','itest') { \$q = Join-Path '$WDIR' \$p; if (Test-Path \$q) { Remove-Item -Recurse -Force \$q } }" \
+    || die "cannot reach the Windows machine"
+to_win "$PKG" "$B/takedawn.ico" "$REPO/tools/release/windows/takedawn.iss" \
+    "$REPO/tools/release/windows/remote.ps1" || die "copy to the Windows machine failed"
+disc_arg=""
+[ -n "${TAKEDAWN_WIN_DISC:-}" ] && disc_arg="-Disc '$TAKEDAWN_WIN_DISC'"
+say "running on Windows: --version, the setup compile, the payload check"
+on_win "powershell -NoProfile -ExecutionPolicy Bypass -File '$WDIR\\remote.ps1' -Dir '$WDIR' -Version $VERSION $disc_arg" \
+    > "$B/remote.log" 2>&1 || { tail -15 "$B/remote.log" >&2; die "the Windows step failed ($B/remote.log)"; }
+grep -a "^STEP\|^RESULT" "$B/remote.log" | tr -d '\r' | sed 's/^/    /'
+mkdir -p "$DIST"
+EXE="$DIST/Takedawn-$VERSION$PKG_TAG-windows-x64-setup.exe"
+from_win "out/Takedawn-$VERSION$PKG_TAG-windows-x64-setup.exe" "$EXE" || die "could not fetch the setup exe"
+from_win version.txt "$B/version.txt"
+from_win version-installed.txt "$B/version-installed.txt"
+for r in $PKG_REGIONS; do
+    use_region "$r"
+    [ -n "$PROG_SUFFIX" ] || continue
+    from_win "version$PROG_SUFFIX.txt" "$B/version$PROG_SUFFIX.txt" || die "no --version of Takedawn$PROG_SUFFIX.exe"
+    assert_gen
+    check_version "$B/version$PROG_SUFFIX.txt" "Takedawn$PROG_SUFFIX.exe on Windows"
+done
+use_region "${PKG_REGIONS%% *}"; assert_gen
+[ -n "$disc_arg" ] && from_win check.txt "$B/check.txt"
+want="$(grep -a '^RESULT OK' "$B/remote.log" | tr -d '\r' | awk '{print $3}')"
+[ "$(sha256_of "$EXE")" = "$want" ] || die "the fetched setup exe is not the one compiled"
+check_version "$B/version.txt" "Takedawn.exe on Windows"
+check_version "$B/version-installed.txt" "Takedawn.exe from the test install"
+if [ -n "$disc_arg" ]; then
+    grep -aq "^RESULT OK" "$B/check.txt" || die "--install --check on Windows gave no RESULT OK"
+    say "Windows --install --check: $(grep -a '^STEP disc OK' "$B/check.txt" | tr -d '\r' | cut -c1-100)"
+fi
+cp "$B/version.txt" "$DIST/version-windows.txt"
+say "$(basename "$EXE"): $(( $(stat -c %s "$EXE" 2>/dev/null || stat -f %z "$EXE") / 1024 / 1024 )) MB, sha256 $(sha256_of "$EXE")"
+say "Windows done in $(( $(date +%s) - t0 )) s (setup window: $HAVE_SETUP)"

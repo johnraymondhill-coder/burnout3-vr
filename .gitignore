@@ -1,0 +1,16 @@
+releases/
+**/Game/
+**/Burnout 3 Takedown/
+**/build*/
+**/__pycache__/
+**/*.iso
+**/*.xbe
+**/*.apk
+**/*.exe
+**/*.dll
+**/*.so
+**/*.o
+**/*.obj
+**/saves/
+**/cache/
+**/logs/

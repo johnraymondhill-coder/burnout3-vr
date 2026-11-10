@@ -1,0 +1,155 @@
+cmake_minimum_required(VERSION 3.20)
+
+# Xbox Kernel Replacement Layer
+# Replaces 147 Xbox kernel imports with Win32 equivalents.
+# Memory layout, file I/O, threading, synchronization, crypto, HAL.
+
+set(KERNEL_SOURCES
+    kernel_path.c
+    kernel_pool.c
+    kernel_rtl.c
+    kernel_memory.c
+    kernel_file.c
+    kernel_saveguard.c
+    kernel_missing.c
+    kernel_thread.c
+    kernel_sync.c
+    kernel_wake.c
+    kernel_hal.c
+    kernel_prof.c
+    kernel_pacing.c
+    kernel_pause.c
+    present_cadence.c
+    power_auto.c
+    present_cadence_ring.c
+    xbox_autoplay.c
+    kernel_frametime.c
+    kernel_xbox.c
+    xnet_hle.c
+    xnet_route.c
+    xnet_netsim.c
+    xnet_lobby.c
+    xnet_upnp.c
+    kernel_ob.c
+    kernel_io.c
+    kernel_crypto.c
+    kernel_console_keys.c
+    kernel_save_import.c
+    kernel_ps2save.c
+    kernel_thunks.c
+    kernel_bridge.c
+    xbox_memory_layout.c
+    xbox_crash.c
+    xbox_report.c
+    icall_feedback.c
+    recomp_trace.c
+    nv2a_pb_scan.c
+    nv2a_pb_exec.c
+    nv2a_backend_common.c
+    nv2a_texrep.c
+    nv2a_texpack.c
+    nv2a_texpack_img.c
+    nv2a_texscale.c
+    nv2a_texscale_store.c
+    nv2a_texup.c
+    nv2a_filmup.c
+    nv2a_vsh_cpu.c
+    nv2a_wide_lines.c
+    nv2a_combiner.c
+)
+
+# miniupnpc (BSD 3-Clause, third_party/miniupnpc): xnet_upnp.c opens the
+# online race port on the router.
+set(MINIUPNPC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/miniupnpc)
+foreach(f addr_is_reserved connecthostport igd_desc_parse minisoap minissdpc miniupnpc
+          miniwget minixml portlistingparse receivedata upnpcommands upnpdev upnperrors upnpreplyparse)
+    list(APPEND KERNEL_SOURCES ${MINIUPNPC_DIR}/src/${f}.c)
+endforeach()
+
+add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+target_compile_definitions(xbox_kernel PRIVATE MINIUPNP_STATICLIB)
+target_include_directories(xbox_kernel PRIVATE ${MINIUPNPC_DIR}/include ${MINIUPNPC_DIR}/src)
+
+# The client's lobby additions (xnet_lobby.c): ctest xnet_lobby.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_lobby
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_lobby)
+
+# The online peers' address choice (xnet_route.c): ctest xnet_route.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_route
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_route)
+
+# The debug switch's delay, jitter and loss (xnet_netsim.c): ctest xnet_netsim.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_netsim
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_netsim)
+
+# The title's sockets against a stand-in lobby (xnet_hle.c, POSIX): ctest xnet_hle.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_hle
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_hle)
+
+# xnet_hle.c: the title's XNet sockets are host sockets (opt-in online play).
+if(WIN32)
+    target_link_libraries(xbox_kernel PUBLIC ws2_32 iphlpapi)
+endif()
+
+# See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
+# CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
+get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
+target_include_directories(xbox_kernel PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${XBOXRECOMP_SRC_DIR}
+)
+
+# The toolkit's commit, for the bug report (xbox_report.c): a header made at
+# every build and rewritten only when the commit changes.
+set(XR_BUILD_ID_DIR ${CMAKE_CURRENT_BINARY_DIR}/build_id)
+add_custom_target(xr_build_id
+    COMMAND ${CMAKE_COMMAND} -DSRC=${XBOXRECOMP_SRC_DIR}/.. -DOUT=${XR_BUILD_ID_DIR}/xr_build_id.h
+            -DMACRO=XR_BUILD_COMMIT -P ${XBOXRECOMP_SRC_DIR}/../cmake/build_id.cmake
+    BYPRODUCTS ${XR_BUILD_ID_DIR}/xr_build_id.h
+    VERBATIM)
+add_dependencies(xbox_kernel xr_build_id)
+target_include_directories(xbox_kernel PRIVATE ${XR_BUILD_ID_DIR})
+set_source_files_properties(xbox_report.c PROPERTIES COMPILE_DEFINITIONS XR_HAVE_BUILD_ID)
+
+if(WIN32)
+    # platform is an INTERFACE target on Windows: it contributes the src/
+    # include path that "platform/xbox_winnt.h" resolves against.
+    # advapi32: the registry (xbox_report.c reads the OS and CPU names).
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt advapi32)
+elseif(ANDROID)
+    # Android: the platform layer alone. The crypto exports (kernel_crypto.c)
+    # are portable C, and the NDK has no OpenSSL to link.
+    target_link_libraries(xbox_kernel PUBLIC platform)
+else()
+    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+endif()
+
+# The watchdog finalises the APU's WAV dump before _exit (apu_wav_close_nowait).
+# Link-only, so xbox_apu follows xbox_kernel on the link line.
+target_link_libraries(xbox_kernel PRIVATE xbox_apu)
+# The trapped-MMIO dispatch (xbox_PosixMmioFault, xbox_VehMmioFault) routes
+# to the APU and to the USB OHCI model.
+target_link_libraries(xbox_kernel PRIVATE xbox_usb)
+
+if(MSVC)
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+endif()
+
+# graphics.ui_scale's filters give the same bytes on every machine (the disk
+# cache's files and the test's checksums): no fused multiply-add there.
+if(NOT MSVC)
+    set_source_files_properties(nv2a_texscale.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
+target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+# graphics.texture_upscale (BO-245): a build from source finds the shader
+# files in the tree when no packaged copy is there.
+set_source_files_properties(nv2a_texup.c PROPERTIES COMPILE_DEFINITIONS
+    "XBOXRECOMP_TEXUP_SRC_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/upscale_shaders\"")
